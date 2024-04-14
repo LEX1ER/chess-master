@@ -1,0 +1,11 @@
+{
+  "name": "Chess Master",
+  "version": "1.0.0",
+  "manifest_version": 3,
+  "content_scripts": [
+    {
+      "matches": ["*://*.chess.com/*"],
+      "js": ["dist/content.js"]
+    }
+  ]
+}
