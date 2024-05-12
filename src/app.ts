@@ -23,7 +23,8 @@ buttonElementShowBestMove.addEventListener("click", async () => {
   const chess = new Chess();
   chess.move("");
   const element = document.querySelector(
-    "wc-vertical-move-list"
+    // possible changes
+    "wc-new-move-list"
   ) as HTMLElement;
   const pgn = elementToPgn(element);
   chess.loadPgn(pgn);
@@ -33,7 +34,7 @@ buttonElementShowBestMove.addEventListener("click", async () => {
     fen,
     depth: 20,
   };
-  spanElementLabel.textContent = 'Thingking . . .';
+  spanElementLabel.textContent = "Thingking . . .";
   const response = await fetch("https://lex2er.bsite.net/api/Chess", {
     method: "POST",
     body: JSON.stringify(move),
@@ -63,6 +64,6 @@ buttonElementShowBestMove.addEventListener("click", async () => {
   board.prepend(highlightRedDiv);
 
   highlightBlueDiv.className = `custom highlight square-${secondSquare}`;
-  highlightBlueDiv.style.backgroundColor = "#90caf9"; 
+  highlightBlueDiv.style.backgroundColor = "#90caf9";
   board.prepend(highlightBlueDiv);
 });
