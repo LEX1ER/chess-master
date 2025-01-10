@@ -24,8 +24,9 @@ buttonElementShowBestMove.addEventListener("click", async () => {
   chess.move("");
   const element = document.querySelector(
     // possible changes
-    "wc-new-move-list"
+    "wc-simple-move-list"
   ) as HTMLElement;
+
   const pgn = elementToPgn(element);
   chess.loadPgn(pgn);
   const fen = chess.fen();
@@ -35,7 +36,7 @@ buttonElementShowBestMove.addEventListener("click", async () => {
     depth: 20,
   };
   spanElementLabel.textContent = "Thingking . . .";
-  const response = await fetch("https://lex2er.bsite.net/api/Chess", {
+  const response = await fetch("http://localhost:5000/api/Chess", {
     method: "POST",
     body: JSON.stringify(move),
     headers: {

@@ -1,9 +1,12 @@
 export function elementToPgn(element: HTMLElement) {
+   
   const chessRows = element?.childNodes;
+
   const pgnArray = [];
   [...chessRows]
     .filter((x: ChildNode) => x.childNodes.length)
     .forEach((chessRow: Element) => {
+
       const chessColumns = chessRow.childNodes;
       const pgnPerColumns = processChessColumns(chessColumns);
       pgnArray.push(...pgnPerColumns);
@@ -20,6 +23,7 @@ function processChessColumns(chessColumns: NodeListOf<ChildNode>) {
       chessColumn.classList?.contains("main-line-row")
     )
     .forEach((mainLineRow: Element) => {
+
       [...mainLineRow.childNodes]
         .filter((mainLineRowChilds: Element) =>
           // possible changes
