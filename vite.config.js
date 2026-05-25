@@ -4,7 +4,7 @@ import { resolve } from "path";
 export default defineConfig({
   plugins: [],
   build: {
-    minify: true,
+    minify: false,
     assetsDir: "",
     sourcemap: false,
     outDir: resolve(__dirname, "dist"),

@@ -12,6 +12,6 @@
   "license": "ISC",
   "devDependencies": {
     "chess.ts": "^0.16.2",
-    "vite": "^4.4.11"
+    "vite": "^8.0.14"
   }
 }
