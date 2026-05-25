@@ -6,8 +6,20 @@ import {
 } from "./html";
 import { elementToPgn } from "./chess";
 
-const STOCKFISH_API_URL = "https://stockfish.online/api/s/v2.php";
-const STOCKFISH_MAX_DEPTH = 15;
+declare const chrome:
+  | {
+      runtime?: {
+        getURL(path: string): string;
+      };
+    }
+  | undefined;
+
+const STOCKFISH_SCRIPT_PATH = "dist/stockfish-18-lite-single.js";
+const STOCKFISH_WASM_PATH = "dist/stockfish-18-lite-single.wasm";
+const STOCKFISH_SEARCH_TIMEOUT_MS = 60_000;
+const STOCKFISH_STARTUP_TIMEOUT_MS = 10_000;
+const STOCKFISH_MAX_DEPTH = 99;
+const DEFAULT_STOCKFISH_DEPTH = 20;
 
 const letterAssignments = {
   a: 1,
@@ -25,36 +37,178 @@ type StockfishRequest = {
   depth: number;
 };
 
-type StockfishResponse = {
-  success?: boolean;
-  bestmove?: string;
-  error?: string;
-};
+type StockfishListener = (line: string) => void;
+
+let stockfishWorker: Promise<Worker> | null = null;
+let stockfishReady: Promise<void> | null = null;
+let stockfishWorkerUrl: string | null = null;
+let stockfishWasmUrl: string | null = null;
+let stockfishAnalysisQueue: Promise<unknown> = Promise.resolve();
+const stockfishListeners = new Set<StockfishListener>();
+
+function getExtensionUrl(path: string) {
+  if (typeof chrome !== "undefined" && chrome.runtime?.getURL) {
+    return chrome.runtime.getURL(path);
+  }
+
+  return path;
+}
+
+async function getStockfishWorkerUrl() {
+  if (!stockfishWorkerUrl) {
+    const [stockfishScript, stockfishWasm] = await Promise.all([
+      fetch(getExtensionUrl(STOCKFISH_SCRIPT_PATH)).then((response) => {
+        if (!response.ok) {
+          throw new Error("Could not load Stockfish script.");
+        }
+
+        return response.text();
+      }),
+      fetch(getExtensionUrl(STOCKFISH_WASM_PATH)).then((response) => {
+        if (!response.ok) {
+          throw new Error("Could not load Stockfish WASM.");
+        }
+
+        return response.blob();
+      }),
+    ]);
+
+    stockfishWasmUrl = URL.createObjectURL(
+      new Blob([stockfishWasm], {
+        type: "application/wasm",
+      })
+    );
+    const stockfishScriptUrl = URL.createObjectURL(new Blob([stockfishScript], {
+      type: "text/javascript",
+    }));
+
+    stockfishWorkerUrl = `${stockfishScriptUrl}#${encodeURIComponent(
+      stockfishWasmUrl
+    )}`;
+  }
+
+  return stockfishWorkerUrl;
+}
+
+function getStockfishWorker() {
+  if (!stockfishWorker) {
+    stockfishWorker = getStockfishWorkerUrl().then((workerUrl) => {
+      const worker = new Worker(workerUrl);
+      worker.onmessage = handleStockfishOutput;
+      worker.onerror = (event) => {
+        stockfishListeners.forEach((listener) =>
+          listener(`stockfish-error ${event.message}`)
+        );
+      };
+
+      return worker;
+    });
+  }
+
+  return stockfishWorker;
+}
+
+async function sendStockfishCommand(command: string) {
+  const worker = await getStockfishWorker();
+  worker.postMessage(command);
+}
+
+function handleStockfishOutput(event: MessageEvent) {
+  String(event.data)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .forEach((line) => {
+      stockfishListeners.forEach((listener) => listener(line));
+    });
+}
+
+function waitForStockfishLine(
+  predicate: (line: string) => boolean,
+  timeoutMessage: string,
+  timeoutMs = STOCKFISH_SEARCH_TIMEOUT_MS
+) {
+  return new Promise<string>((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      stockfishListeners.delete(listener);
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+
+    const listener = (line: string) => {
+      if (line.startsWith("stockfish-error ")) {
+        window.clearTimeout(timeoutId);
+        stockfishListeners.delete(listener);
+        reject(new Error(line.replace("stockfish-error ", "")));
+        return;
+      }
+
+      if (!predicate(line)) {
+        return;
+      }
+
+      window.clearTimeout(timeoutId);
+      stockfishListeners.delete(listener);
+      resolve(line);
+    };
+
+    stockfishListeners.add(listener);
+  });
+}
+
+function getStockfishReady() {
+  if (!stockfishReady) {
+    stockfishReady = (async () => {
+      const ready = waitForStockfishLine(
+        (line) => line === "uciok",
+        "Stockfish did not initialize.",
+        STOCKFISH_STARTUP_TIMEOUT_MS
+      );
+      await sendStockfishCommand("uci");
+      await ready;
+    })().catch((error) => {
+      stockfishReady = null;
+      throw error;
+    });
+  }
+
+  return stockfishReady;
+}
 
 async function analyzeWithStockfish({ fen, depth }: StockfishRequest) {
   if (!Number.isFinite(depth) || depth < 1 || depth > STOCKFISH_MAX_DEPTH) {
     throw new Error(`Depth must be between 1 and ${STOCKFISH_MAX_DEPTH}.`);
   }
 
-  const params = new URLSearchParams({
-    fen,
-    depth: Math.floor(depth).toString(),
-  });
+  const runAnalysis = async () => {
+    await getStockfishReady();
 
-  const response = await fetch(`${STOCKFISH_API_URL}?${params.toString()}`);
-  if (!response.ok) {
-    throw new Error(`Stockfish request failed: ${response.status}`);
-  }
+    await sendStockfishCommand("ucinewgame");
+    const ready = waitForStockfishLine(
+      (line) => line === "readyok",
+      "Stockfish did not become ready."
+    );
+    await sendStockfishCommand("isready");
+    await ready;
 
-  const data = (await response.json()) as StockfishResponse;
-  if (data.success === false) {
-    throw new Error(data.error || "Stockfish could not analyze this position.");
-  }
-  if (!data.bestmove) {
-    throw new Error("Stockfish did not return a best move.");
-  }
+    await sendStockfishCommand(`position fen ${fen}`);
+    const bestMove = waitForStockfishLine(
+      (line) => line.startsWith("bestmove "),
+      "Stockfish analysis timed out."
+    );
+    await sendStockfishCommand(`go depth ${Math.floor(depth)}`);
 
-  return data.bestmove;
+    try {
+      return await bestMove;
+    } catch (error) {
+      await sendStockfishCommand("stop");
+      throw error;
+    }
+  };
+
+  const result = stockfishAnalysisQueue.then(runAnalysis);
+  stockfishAnalysisQueue = result.catch(() => undefined);
+
+  return result;
 }
 
 function getBestMoveFromResponse(response: string) {
@@ -106,8 +260,8 @@ buttonElementShowBestMove.addEventListener("click", async () => {
     return;
   }
 
-  const pgn = elementToPgn(element);
-  if (!chess.loadPgn(pgn)) {
+  const pgn = elementToPgn(element).trim();
+  if (pgn && !chess.loadPgn(pgn)) {
     spanElementLabel.textContent = "Could not read current game.";
     return;
   }
@@ -116,13 +270,14 @@ buttonElementShowBestMove.addEventListener("click", async () => {
 
   const move = {
     fen,
-    depth: 15,
+    depth: DEFAULT_STOCKFISH_DEPTH,
   };
 
   spanElementLabel.textContent = "Thinking . . .";
 
   try {
     const data = await analyzeWithStockfish(move);
+    console.log(data)
     const bestMove = getBestMoveFromResponse(data);
     if (!bestMove) {
       throw new Error("Could not parse Stockfish best move.");
