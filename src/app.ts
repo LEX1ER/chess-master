@@ -1,4 +1,5 @@
 import { Chess } from "chess.ts";
+import type { PartialMove, PieceSymbol } from "chess.ts";
 import {
   buttonElementShowBestMove,
   divElementContainer,
@@ -20,6 +21,7 @@ const STOCKFISH_SEARCH_TIMEOUT_MS = 60_000;
 const STOCKFISH_STARTUP_TIMEOUT_MS = 10_000;
 const STOCKFISH_MAX_DEPTH = 99;
 const DEFAULT_STOCKFISH_DEPTH = 20;
+const MAX_CONTINUATION_CACHE_SIZE = 128;
 
 const letterAssignments = {
   a: 1,
@@ -45,6 +47,7 @@ let stockfishWorkerUrl: string | null = null;
 let stockfishWasmUrl: string | null = null;
 let stockfishAnalysisQueue: Promise<unknown> = Promise.resolve();
 const stockfishListeners = new Set<StockfishListener>();
+const continuationCache = new Map<string, string>();
 
 function getExtensionUrl(path: string) {
   if (typeof chrome !== "undefined" && chrome.runtime?.getURL) {
@@ -174,34 +177,153 @@ function getStockfishReady() {
   return stockfishReady;
 }
 
+function getFenPositionKey(fen: string) {
+  return fen.split(" ").slice(0, 4).join(" ");
+}
+
+function isUciMove(move: string) {
+  return /^[a-h][1-8][a-h][1-8][qrbn]?$/.test(move);
+}
+
+function uciMoveToChessMove(move: string): PartialMove {
+  const chessMove: PartialMove = {
+    from: move.slice(0, 2),
+    to: move.slice(2, 4),
+  };
+
+  if (move[4]) {
+    chessMove.promotion = move[4] as PieceSymbol;
+  }
+
+  return chessMove;
+}
+
+function trimContinuationCache() {
+  while (continuationCache.size > MAX_CONTINUATION_CACHE_SIZE) {
+    const oldestKey = continuationCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+
+    continuationCache.delete(oldestKey);
+  }
+}
+
+function getPrincipalVariationFromLine(line: string) {
+  const match = line.match(/\bpv\s+(.+)$/i);
+  if (!match) {
+    return [];
+  }
+
+  return match[1].split(/\s+/).filter(isUciMove);
+}
+
+function getPonderMoveFromResponse(response: string) {
+  return response.match(/\bponder\s+([a-h][1-8][a-h][1-8][qrbn]?)/i)?.[1];
+}
+
+function getContinuationFromAnalysis(response: string, principalVariation: string[]) {
+  const bestMove = getBestMoveFromResponse(response);
+  if (!bestMove) {
+    return principalVariation;
+  }
+  if (principalVariation[0] === bestMove) {
+    return principalVariation;
+  }
+
+  const ponderMove = getPonderMoveFromResponse(response);
+  return [bestMove, ...(ponderMove ? [ponderMove] : [])];
+}
+
+function rememberContinuation(fen: string, continuation: string[]) {
+  const chess = new Chess(fen);
+
+  for (const move of continuation) {
+    if (!isUciMove(move)) {
+      break;
+    }
+
+    continuationCache.set(getFenPositionKey(chess.fen()), move);
+
+    if (!chess.move(uciMoveToChessMove(move))) {
+      continuationCache.delete(getFenPositionKey(chess.fen()));
+      break;
+    }
+  }
+
+  trimContinuationCache();
+}
+
+function getCachedBestMove(fen: string) {
+  const key = getFenPositionKey(fen);
+  const cachedMove = continuationCache.get(key);
+  if (!cachedMove) {
+    return null;
+  }
+
+  const chess = new Chess(fen);
+  if (!chess.move(uciMoveToChessMove(cachedMove))) {
+    continuationCache.delete(key);
+    return null;
+  }
+
+  continuationCache.delete(key);
+  continuationCache.set(key, cachedMove);
+
+  return cachedMove;
+}
+
 async function analyzeWithStockfish({ fen, depth }: StockfishRequest) {
   if (!Number.isFinite(depth) || depth < 1 || depth > STOCKFISH_MAX_DEPTH) {
     throw new Error(`Depth must be between 1 and ${STOCKFISH_MAX_DEPTH}.`);
   }
 
+  const cachedMove = getCachedBestMove(fen);
+  if (cachedMove) {
+    return `bestmove ${cachedMove} cached`;
+  }
+
   const runAnalysis = async () => {
+    let principalVariation: string[] = [];
+    const principalVariationListener = (line: string) => {
+      const variation = getPrincipalVariationFromLine(line);
+      if (variation.length) {
+        principalVariation = variation;
+      }
+    };
+
+    stockfishListeners.add(principalVariationListener);
+
     await getStockfishReady();
 
-    await sendStockfishCommand("ucinewgame");
-    const ready = waitForStockfishLine(
-      (line) => line === "readyok",
-      "Stockfish did not become ready."
-    );
-    await sendStockfishCommand("isready");
-    await ready;
-
-    await sendStockfishCommand(`position fen ${fen}`);
-    const bestMove = waitForStockfishLine(
-      (line) => line.startsWith("bestmove "),
-      "Stockfish analysis timed out."
-    );
-    await sendStockfishCommand(`go depth ${Math.floor(depth)}`);
-
     try {
-      return await bestMove;
+      await sendStockfishCommand("ucinewgame");
+      const ready = waitForStockfishLine(
+        (line) => line === "readyok",
+        "Stockfish did not become ready."
+      );
+      await sendStockfishCommand("isready");
+      await ready;
+
+      await sendStockfishCommand(`position fen ${fen}`);
+      const bestMove = waitForStockfishLine(
+        (line) => line.startsWith("bestmove "),
+        "Stockfish analysis timed out."
+      );
+      await sendStockfishCommand(`go depth ${Math.floor(depth)}`);
+
+      const response = await bestMove;
+      rememberContinuation(
+        fen,
+        getContinuationFromAnalysis(response, principalVariation)
+      );
+
+      return response;
     } catch (error) {
       await sendStockfishCommand("stop");
       throw error;
+    } finally {
+      stockfishListeners.delete(principalVariationListener);
     }
   };
 
@@ -277,7 +399,6 @@ buttonElementShowBestMove.addEventListener("click", async () => {
 
   try {
     const data = await analyzeWithStockfish(move);
-    console.log(data)
     const bestMove = getBestMoveFromResponse(data);
     if (!bestMove) {
       throw new Error("Could not parse Stockfish best move.");
